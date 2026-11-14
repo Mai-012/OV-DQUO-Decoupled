@@ -37,6 +37,7 @@ def get_args_parser():
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--resume", default="", help="resume from checkpoint")
+    parser.add_argument("--finetune", action="store_true", help="only load model weights and reset epoch/optimizer for finetuning")
     parser.add_argument("--start_epoch", default=0, type=int, metavar="N", help="start epoch")
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--num_workers", default=4, type=int)
@@ -141,6 +142,11 @@ def main(args):
         )
     )
     param_dicts = get_param_dict(args, model_without_ddp)
+    # === [新增：将模块一与模块二的可训练参数加入优化器] ===
+    criterion_params = [p for p in criterion.parameters() if p.requires_grad]
+    if len(criterion_params) > 0:
+        param_dicts.append({"params": criterion_params, "lr": args.lr})
+    # ================================================
     if args.amp:
         eps = 1e-6
     else:
@@ -195,17 +201,20 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
-        model_without_ddp.load_state_dict(checkpoint["model"])
+        model_without_ddp.load_state_dict(checkpoint["model"], strict=not args.finetune)
+        if "criterion" in checkpoint and not args.finetune:
+            criterion.load_state_dict(checkpoint["criterion"], strict=False)
         if args.use_ema:
             if "ema_model" in checkpoint:
                 ema_m.module.load_state_dict(
-                    utils.clean_state_dict(checkpoint["ema_model"])
+                    utils.clean_state_dict(checkpoint["ema_model"]), strict=not args.finetune
                 )
             else:
                 del ema_m
-                ema_m = ModelEma(model, args.ema_decay) 
+                ema_m = ModelEma(model, args.ema_decay)
         if (
             not args.eval
+            and not args.finetune
             and "optimizer" in checkpoint
             and "lr_scheduler" in checkpoint
             and "epoch" in checkpoint
@@ -259,6 +268,7 @@ def main(args):
             for checkpoint_path in checkpoint_paths:
                 weights = {
                     "model": model_without_ddp.state_dict(),
+                    "criterion": criterion.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "lr_scheduler": lr_scheduler.state_dict(),
                     "epoch": epoch,
