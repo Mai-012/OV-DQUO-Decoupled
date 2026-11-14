@@ -5,12 +5,29 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 from util.misc import ( get_world_size, 
                        is_dist_avail_and_initialized)
 import torch.nn.functional as F
+from models.custom_modules import DecoupledUnknownMiningModule, AnchorLocalContextDistillModule
 
 
 class OVSetCriterion_Pseudo(OVSetCriterion):
-    def __init__(self,**kwargs):
+    def __init__(self, args=None, **kwargs):
         super().__init__(**kwargs)
         self.gamma = 0.5
+        self.args = args
+        self.use_module1 = getattr(args, "use_module1", False) if args is not None else False
+        self.use_module2 = getattr(args, "use_module2", False) if args is not None else False
+        text_dim = getattr(args, "text_dim", 1024) if args is not None else 1024
+        hidden_dim = getattr(args, "hidden_dim", 256) if args is not None else 256
+        top_k = getattr(args, "top_k_seeds", 10) if args is not None else 10
+        num_nb = getattr(args, "num_neighbors", 3) if args is not None else 3
+
+        if self.use_module1 or self.use_module2:
+            self.module1_decouple = DecoupledUnknownMiningModule(
+                text_dim=text_dim, hidden_dim=hidden_dim, top_k_seeds=top_k
+            )
+        if self.use_module2:
+            self.module2_local_kd = AnchorLocalContextDistillModule(
+                hidden_dim=hidden_dim, text_dim=text_dim, num_neighbors=num_nb
+            )
 
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}
@@ -28,6 +45,44 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
         num_pseudo_boxes = torch.clamp(num_pseudo_boxes / get_world_size(), min=1).item()
         losses = {}
 
+        # === [新增：计算模块一（解耦）与模块二（局部上下文蒸馏）损失] ===
+        ignore_seed_mask = None
+        if self.training and (self.use_module1 or self.use_module2) and "roi_features" in outputs:
+            bs, num_q = outputs["pred_logits"].shape[:2]
+            base_matched_mask = torch.zeros((bs, num_q), dtype=torch.bool, device=device)
+            pseudo_matched_mask = torch.zeros((bs, num_q), dtype=torch.bool, device=device)
+            for b_i, (src_i, _) in enumerate(indices):
+                base_matched_mask[b_i, src_i] = True
+            for b_i, (src_i, _) in enumerate(pseudo_indices):
+                pseudo_matched_mask[b_i, src_i] = True
+            matched_mask = base_matched_mask | pseudo_matched_mask
+
+            m1_out = self.module1_decouple(
+                pred_logits=outputs["pred_logits"],
+                pred_boxes=outputs["pred_boxes"],
+                roi_features=outputs["roi_features"],
+                text_features=outputs["text_feature"],
+                global_img_feat=outputs["global_img_feat"],
+                matched_mask=matched_mask,
+            )
+            ignore_seed_mask = m1_out["unknown_seed_mask"]
+            if self.use_module1:
+                losses["loss_cel"] = m1_out["loss_cel"]
+                losses["loss_dyn_bg"] = m1_out["loss_dyn_bg"]
+
+            if self.use_module2:
+                m2_out = self.module2_local_kd(
+                    hs_last=outputs["hs_last"],
+                    pred_boxes=outputs["pred_boxes"],
+                    unknown_seed_mask=m1_out["unknown_seed_mask"],
+                    base_matched_mask=base_matched_mask,
+                    pure_bg_mask=m1_out["pure_bg_mask"],
+                    roi_features=outputs["roi_features"],
+                    extract_union_roi_fn=outputs["extract_union_roi_fn"],
+                )
+                losses["loss_kd_bce"] = m2_out["loss_kd_bce"]
+                losses["loss_kd_nce"] = m2_out["loss_kd_nce"]
+        # ==============================================================
 
         ######### start for denoise loss ######### 
         dn_meta = outputs["dn_meta"]
@@ -65,7 +120,7 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
         ######### start bbox&classification loss for decoders ######### 
         for loss in self.losses:
             if loss=="labels":
-                losses.update(self._loss_labels_vfl(outputs, targets, indices,num_boxes,pseudo_indices, num_pseudo_boxes,weight))
+                losses.update(self._loss_labels_vfl(outputs, targets, indices,num_boxes,pseudo_indices, num_pseudo_boxes,weight, ignore_seed_mask=ignore_seed_mask))
             else:
                 losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
         if "aux_outputs" in outputs:
@@ -209,7 +264,7 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
         losses = {"loss_ce": loss_ce}
         return losses
     
-    def _loss_labels_vfl(self, outputs, targets, indices, num_boxes, pseudo_indices, num_pseudo_boxes, pseudo_weight, log=True, dn=False):
+    def _loss_labels_vfl(self, outputs, targets, indices, num_boxes, pseudo_indices, num_pseudo_boxes, pseudo_weight, log=True, dn=False, ignore_seed_mask=None):
         focal_alpha=0.75
         focal_gamma=2.0
         assert 'pred_boxes' in outputs
@@ -253,6 +308,8 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
         weight_mask = torch.ones_like(loss_ce)
         pseudo_weight=pseudo_weight.view(-1, 1)**self.gamma
         weight_mask[pseudo_idx]=pseudo_weight
+        if ignore_seed_mask is not None:
+            weight_mask[ignore_seed_mask] = 0.0
         loss_ce = loss_ce * weight_mask
         loss_ce = loss_ce.mean(1).sum() / (num_boxes+num_pseudo_boxes) * src_logits.shape[1]
         losses = {"loss_ce": loss_ce}

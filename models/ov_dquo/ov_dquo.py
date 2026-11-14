@@ -381,6 +381,62 @@ class OV_DQUO(nn.Module):
             final_outputs_class = final_outputs_class[:, :, :-1]
             final_outputs_class = inverse_sigmoid(final_outputs_class)
             out["pred_logits"] = final_outputs_class
+        
+        # === [新增：模块一 & 模块二 训练期特征与局部区域袋提取钩子] ===
+        if self.training and (getattr(self.args, "use_module1", False) or getattr(self.args, "use_module2", False)):
+            # 1. 剥离去噪查询 (DN queries)，只保留与 outputs_coord_list[-1] 一一对应的 1000 个匹配查询隐状态
+            if self.dn_number > 0 and dn_meta is not None and "pad_size" in dn_meta:
+                out["hs_last"] = hs[-1][:, dn_meta["pad_size"]:, :]
+            else:
+                out["hs_last"] = hs[-1]
+            out["text_feature"] = text_feature
+
+            # 2. 复用冻结的 CLIP 视觉编码器提取任意框的 RoI 特征（无额外显存开销）
+            def _extract_roi_for_boxes(boxes_per_img):
+                """boxes_per_img: list of Tensor [N_i, 4] (cx, cy, w, h)"""
+                with torch.no_grad():
+                    if "RN" in self.args.backbone:
+                        src_feat = ori_clip_features["layer3"]
+                        sizes = [((1 - m[0].float()).sum(), (1 - m[:, 0].float()).sum()) for m in src_feat.decompose()[1]]
+                        feats_list = []
+                        for b_i, b_boxes in enumerate(boxes_per_img):
+                            if b_boxes.numel() == 0:
+                                continue
+                            f = sample_feature_rn(
+                                [sizes[b_i]],
+                                b_boxes.unsqueeze(0),
+                                src_feat.tensors[b_i : b_i + 1],
+                                self.args,
+                                self.backbone,
+                                extra_conv=True,
+                            ).squeeze(0)
+                            feats_list.append(f)
+                    else:
+                        src_feat = ori_clip_features["dense"]
+                        sizes = [((1 - m[0].float()).sum(), (1 - m[:, 0].float()).sum()) for m in src_feat.decompose()[1]]
+                        feats_list = []
+                        for b_i, b_boxes in enumerate(boxes_per_img):
+                            if b_boxes.numel() == 0:
+                                continue
+                            f = sample_feature_vit(
+                                [sizes[b_i]],
+                                b_boxes.unsqueeze(0),
+                                src_feat.tensors[b_i : b_i + 1],
+                            ).squeeze(0)
+                            feats_list.append(f)
+
+                    if len(feats_list) > 0:
+                        return torch.cat(feats_list, dim=0)
+                    return torch.zeros((0, text_feature.shape[-1]), device=text_feature.device)
+
+            bs_cur, num_q_cur = outputs_coord_list[-1].shape[:2]
+            all_roi = _extract_roi_for_boxes([outputs_coord_list[-1][b] for b in range(bs_cur)])
+            out["roi_features"] = all_roi.view(bs_cur, num_q_cur, -1)
+
+            full_img_boxes = [torch.tensor([[0.5, 0.5, 1.0, 1.0]], device=text_feature.device) for _ in range(bs_cur)]
+            out["global_img_feat"] = _extract_roi_for_boxes(full_img_boxes)
+            out["extract_union_roi_fn"] = _extract_roi_for_boxes
+        # ==============================================================
         return out
 
 
@@ -481,6 +537,15 @@ def build_ov_dquo(args):
         )
         weight_dict.update(interm_weight_dict)
 
+    # === [新增：注册模块一与模块二的损失权重] ===
+    if getattr(args, "use_module1", False):
+        weight_dict["loss_cel"] = getattr(args, "cel_loss_coef", 0.5)
+        weight_dict["loss_dyn_bg"] = getattr(args, "dyn_bg_loss_coef", 0.3)
+    if getattr(args, "use_module2", False):
+        weight_dict["loss_kd_bce"] = getattr(args, "kd_bce_loss_coef", 0.5)
+        weight_dict["loss_kd_nce"] = getattr(args, "kd_nce_loss_coef", 0.5)
+    # ==========================================
+
     losses = ["labels", "boxes"]
     ov_matcher, vanilla_matcher = build_ov_matcher(args)
     criterion = OVSetCriterion_Pseudo(
@@ -489,6 +554,7 @@ def build_ov_dquo(args):
         weight_dict=weight_dict,
         focal_alpha=args.focal_alpha,
         losses=losses,
+        args=args,
     )
     criterion.to(device)
     postprocessors = {"bbox": OVPostProcess(args)}

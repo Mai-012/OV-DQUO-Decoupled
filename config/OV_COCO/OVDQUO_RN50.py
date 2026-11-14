@@ -124,3 +124,14 @@ label_version = "standard"
 repeat_factor_sampling=False
 num_label_sampled=48 # keep compatible with ovlvis
 ##### end dataset parameters ##### 
+
+##### start custom ablation switches (Module 1 & Module 2) #####
+use_module1 = True          # 模块一开关：去偏未知挖掘 + 动态背景 + CEL去偏
+use_module2 = True          # 模块二开关：新类锚点区域袋 + 掩码过滤 + BCE/InfoNCE蒸馏
+top_k_seeds = 10            # 每张图挖掘的未知新类种子数量
+num_neighbors = 3           # 每个新类锚点关联的邻近基类数量
+cel_loss_coef = 0.5         # 基类均匀分布约束损失权重
+dyn_bg_loss_coef = 0.3      # 动态背景提示词损失权重
+kd_bce_loss_coef = 0.5      # DK-DETR BCE 对比蒸馏损失权重
+kd_nce_loss_coef = 0.5      # BARON 区域袋 InfoNCE 蒸馏损失权重
+##### end custom ablation switches #####
